@@ -1,199 +1,99 @@
-# Embedded and Edge Artificial Intelligence - Radar project
+# Project Development Files
 
-**Project Assignment · Politecnico di Milano**  
-Department of Electronics, Information and Bioengineering
+This directory contains the complete development pipeline for the Embedded and
+Edge AI project: exploratory analysis, preprocessing experiments, model
+training, cross-validation, reusable Python modules, experiment metadata, and
+trained checkpoints.
 
----
+When the project is finalised, these files belong in the repository's `src/`
+directory. 
 
-## Task
+## Recommended execution order
 
-Build a **TinyML system** that estimates the **2D positions of up to 4 people** inside a room using raw **UWB radar signals** (Channel Impulse Response - CIR).
+| Order | File | Purpose |
+|---:|---|---|
+| 1 | `01_eda_huggingface.ipynb` | Load the private Hugging Face dataset and perform exploratory data analysis. |
+| 2 | `02_boundary_analysis.ipynb` | Investigate the out-of-room ground-truth observations identified during EDA. |
+| 3a | `03a_preprocessing_magnitude.ipynb` | Define the log-magnitude preprocessing used by V1-V4. |
+| 3b | `03b_preprocessing_signed_iq.ipynb` | Define the signed I/Q representation used by V5. |
+| 3c | `03c_preprocessing_fused_magnitude_iq.ipynb` | Define the magnitude and signed-I/Q representation used by V6. |
+| 3d | `03d_v7_alternative_split_and_preprocessing.ipynb` | Define the alternative acquisition-level split used by V7-V11. |
+| 3e | `03e_preprocessing_phase_ema_temporal.ipynb` | Define the phase-aware, EMA and previous-frame representation used by V10-V11. |
+| 4 | `04_baseline_model.ipynb` | Train and compare model versions V1-V12, then export the selected INT8 model. |
+| 5 | `05_v11_stratified_group_cross_validation.ipynb` | Run the grouped two-fold robustness assessment for V11. |
+| 6 | `06_edge_optimization_audit.ipynb` | Audit float-versus-INT8 size, activation memory, operations, streaming preprocessing memory, and batch-1 desktop latency. |
 
-| Property | Value |
-|---|---|
-| Input | Single `.npy` file of shape `(T, 6, 3, 120, 2)` |
-| Output | `.jsonl` file - one JSON object per frame |
-| Target hardware | ESP32-S3 via TensorFlow Lite for Microcontrollers |
-| Max people per frame | 4 (minimum 0) |
-| Room dimensions | 4.8 m × 7.2 m |
+The notebooks retain their outputs so that the experimental decisions and
+results can be inspected without retraining every model.
 
----
+## Reusable modules
 
-## Dataset
+- `eda.py`: validation and aggregation utilities used by the EDA.
+- `preprocessing.py`: preprocessing, target construction, and split utilities.
+- `modeling.py`: model builders, custom losses, and evaluation metrics.
 
-The dataset is published on **Hugging Face** under the private `HAEEAI` organisation  
-([multi-person-localization](https://huggingface.co/datasets/HAEEAI/multi-person-localization)).
+## Environment setup
 
-### Sensor Setup
+The development environment is intentionally separate from the protected root
+`requirements.txt` in the GitHub Classroom repository. That protected file
+defines only the libraries allowed during final inference.
 
-- **6 fixed UWB radar sensors** (TSRR250) placed around the room perimeter at 1.2 m height
-- Each radar has **3 antennas** (L-shape array, 7.5 mm spacing), **120 range bins**, sampled at **25 Hz**
-- **1 bin = 0.15 m** — total physical range 18 m
-- **Field of view ≈ 120°** (±60° around boresight)
-- **First 5 bins** contain direct TX→RX coupling and are typically discarded
-- **24 acquisition windows**, each 300 s (7 500 frames) - 180 000 frames total
+From the project root, run:
 
-### Data Format (`.npz` per acquisition window)
+```powershell
+.\src\setup_training_env.ps1
+```
 
-| Array | Shape | Description |
+Then select the `EEAI Training` Jupyter kernel. The script creates
+`.venv_training`, installs `src/requirements-training.txt`, verifies the core
+packages, and registers the kernel. EDA-only dependencies are listed in
+`requirements-eda.txt`.
+
+Virtual environments are machine-specific and must not be copied into `src/`
+or committed to Git.
+
+## Dataset access
+
+The private dataset is loaded from Hugging Face. Set a read-only token before
+starting Jupyter:
+
+```powershell
+$env:HF_TOKEN = "your_read_only_token"
+```
+
+## Preprocessing experiment map
+
+| Representation | Model versions | Main reproducibility artifact |
 |---|---|---|
-| `radar_cir_iq` | `(T, 6, 3, 120, 2)` | Complex CIR - T frames × 6 radars × 3 antennas × 120 bins × [I, Q] |
-| `people_xy` | `(T, 4, 2)` | Ground-truth [x, y] positions in metres (zero-padded) |
-| `people_mask` | `(T, 4)` | Boolean mask — True for active persons |
-| `timestamps` | `(T,)` | Acquisition timestamps |
+| Log magnitude | V1-V4 | `artifacts/preprocessing_config.json` |
+| Signed log-I/Q | V5 | `artifacts/v5_iq_normalization.json` |
+| Magnitude and signed I/Q | V6 | `artifacts/v6_fused_normalization.json` |
+| Fused input with alternative grouped split | V7-V9 | `artifacts/data_split_v7.json`, `artifacts/v7_fused_normalization.json` |
+| Magnitude, causal EMA residual, signed I/Q, phase differences, and previous-frame context | V10-V11 | `artifacts/v10_phase_ema_temporal_normalization.json` |
 
-The complex CIR is reconstructed as:
+Training-only normalisation statistics are estimated using the corresponding
+training acquisition windows. Ground-truth coordinates are preserved for
+analysis and clipped to the official room bounds only when targets or final
+predictions are constructed.
 
-```python
-cir = radar_cir_iq[..., 0] + 1j * radar_cir_iq[..., 1]   # shape (T, 6, 3, 120)
-```
+## Artifacts and models
 
-### Coordinate System
-
-- Origin at the **bottom-left corner** of the room
-- **x** axis: positive to the right (0 → 4.8 m)
-- **y** axis: positive upward (0 → 7.2 m)
-- All positions in **metres**
-
----
-
-## Input / Output Specification
-
-### Input to `code.py`
-
-A single `.npy` file of shape `(T, 6, 3, 120, 2)` — raw CIR measurements without ground truth.
-
-### Output from `code.py`
-
-A `.jsonl` file with **one JSON object per frame**:
-
-```jsonl
-{"frame": 36, "localizations": [[1.2, 3.4], [2.5, 5.1]]}
-{"frame": 37, "localizations": [[1.3, 3.5]]}
-{"frame": 38, "localizations": []}
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `frame` | int | 0-based frame index |
-| `localizations` | list of [x, y] | Predicted positions in metres; empty list `[]` if no person detected |
-
-### How `code.py` is called
-
-```bash
-python submission/code.py \
-    --input-path  <path/to/input.npy> \
-    --output-path <path/to/output.jsonl>
-```
-
-### Constraints on `code.py`
-
-Only the packages listed in `requirements.txt` may be imported:
-
-| Package | Version | Permitted use |
-|---|---|---|
-| `numpy` | ≥ 2.0.0 | All array operations and preprocessing |
-| `scipy` | ≥ 1.10.0 | `ndimage`, `signal`, `spatial` submodules |
-| `tensorflow` | ≥ 2.13.0 | `tf.lite.Interpreter` only, not `tf.keras` |
-
-Python standard library modules (`argparse`, `json`, `sys`, `pathlib`, `math`, `collections`, `itertools`, …) are always permitted.  
-Any other third-party import will cause evaluation failure.
-
-- Model must be in **TFLite format** (`model.tflite`)
-- File names must be exactly `code.py` and `model.tflite`
-
----
-
-## ESP32-S3 Deployment Constraints
-
-Your model will **not** be deployed on real hardware, but it **must meet** these constraints:
-
-| Check | Limit | Notes |
-|---|---|---|
-| Model file size | **< 800 KB** | Flash budget |
-| Activation arena (SRAM) | **< 300 KB** | Model arena only - preprocessing in `code.py` consumes additional SRAM |
-| Quantization | INT8 recommended | 4× smaller and faster on ESP32-S3 |
-| Forbidden ops | **No LSTM / GRU / RNN / CUSTOM / Flex** | Not supported by TFLM on ESP32-S3 |
-
-Standard supported layers: `Conv2D`, `DepthwiseConv2D`, `Dense`, `BatchNormalization`, `MaxPool2D`, `AveragePooling2D`, `Add`, `ReLU`.
-
----
-
-## Evaluation Metrics
-
-### F1 Score (primary detection metric)
-
-Hungarian matching with a **1.0 m acceptance threshold**:
-
-- **TP**: predicted position matched to a GT person within 1.0 m
-- **FP**: predicted position with no GT match
-- **FN**: GT person not detected
-
-```
-Precision = TP / (TP + FP)
-Recall    = TP / (TP + FN)
-F1        = 2 × Precision × Recall / (Precision + Recall)
-```
-
-### Additional Reported Metrics (informational)
-
-- **RMSE**, **MAE**, **Median error**, **P90** - on TP matched pairs only
-- **Count MAE**, **Count accuracy** - person count per frame
-
----
-
-## Testing Locally
-
-Before submitting, run the full pipeline on the provided example.
-
-**Step 1 - Run inference**
-```bash
-python submission/code.py \
-    --input-path  evaluation/example/input_test.npy \
-    --output-path evaluation/example/my_output.jsonl
-```
-
-**Step 2 - Validate output format and check performance**
-```bash
-python evaluation/evaluate_performance.py \
-    --gt-path   evaluation/example/output_test.jsonl \
-    --pred-path evaluation/example/my_output.jsonl
-```
-
-**Step 3 - Check ESP32-S3 constraints**
-```bash
-python evaluation/evaluate_constraint.py \
-    --model-path submission/model.tflite
-```
-
-> The example input/output is derived from training data and is provided for
-> **format verification and sanity checking only**.
-> The final evaluation uses a separate acquisition session not seen during training.
-
----
-
-## Repository Structure
-
-```
-submission/
-    code.py          ← inference script (required, exact name)
-    model.tflite     ← trained TFLite model (required, exact name)
-
-report/
-    report.pdf       ← project report
-
-src/
-    ...              ← training notebooks, scripts, experiments
-
-evaluation/          ← provided - do not modify
-    evaluate_performance.py
-    evaluate_constraint.py
-    example/
-        input_test.npy
-        output_test.jsonl
-
-requirements.txt     ← allowed libraries - do not modify
-```
+- `artifacts/` contains saved splits, normalisation statistics, training
+  histories, thresholds, and evaluation summaries.
+- `models/` contains development checkpoints for the documented experiments.
+- `models/baseline_v11_full_int8.tflite` is the current deployment candidate.
+- `outputs/eda/` contains the compact EDA summaries used by the notebooks and
+  report.
+- `outputs/edge_audit/` contains the reproducible float-versus-INT8 comparison,
+  memory summary, latency measurements, and report-ready figure.
 
 
+## Final repository placement
 
+At finalisation time:
+
+1. Copy the contents of this directory into the repository's `src/` folder.
+2. Keep `submission/code.py` and `submission/model.tflite` in `submission/`.
+3. Keep the final report at `report/report.pdf`.
+4. Do not modify `evaluation/` or the protected root `requirements.txt`.
+5. Do not copy `.venv_training`, secrets, caches, or temporary evaluator output.
